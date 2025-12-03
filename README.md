@@ -62,7 +62,7 @@ We provide metadata for each frame:
     - global_trans_blender: translations (in meters) of the device and cameras in the Blender global coordinate system
     - global_rot_blender: rotations (in radians) in the Blender global coordinate system
     - smplx_params: SMPL-X parameters (gendered version)
-    - joints (Note that this data is processed with smplx_params):
+    - joints (**extracted from smplx_params**):
         - trans_blender: translations (in meters) of joints in the Blender global coordinate system
         - device_pts3d: device-relative 3D joint locations (in centimeters) in the OpenCV coordinate system
         - camera_front/back_left/right_pts3d: camera-relative 3D joint locations (in centimeters) in the OpenCV coordinate system
@@ -111,7 +111,7 @@ We provide metadata for each frame:
     - camera_pose: transformation matrix (in meters) of the cameras attached to the HMD device in the Blender global coordinate system
     - global_rot_blender: rotations (in radians) in the Blender global coordinate system
     - smplx_params_gendered/neutral: SMPL-X parameters compatible with [EasyMocap](https://github.com/zju3dv/EasyMocap)
-    - joints (Note that this data is processed with mocap data from our studio, not smplx_params):
+    - joints (**extracted from our mocap studio data, with a different skeleton structure from smplx_params**):
         - trans: translations (in centimeters) of joints in the Blender global coordinate system
         - device_pts3d: device-relative 3D joint locations (in centimeters) in the OpenCV coordinate system
         - camera_front/back_left/right_pts3d: camera-relative 3D joint locations (in centimeters) in the OpenCV coordinate system
