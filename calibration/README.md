@@ -62,6 +62,41 @@ and `camera_front_right.json`, then point the model config at the folder:
 camera_calib_file_dir_path: ./calibration/my_rig
 ```
 
+## Extrinsic calibration (second GUI tab)
+
+After calibrating both cameras' intrinsics, switch to the **Extrinsic (stereo
+pair)** tab to calibrate the rigid transform between them and generate
+EgoRear's `device_to_camera_*` matrices:
+
+1. Select the **two** camera devices (metadata-only nodes are filtered out
+   automatically) and the resolution, point the two file fields at the saved
+   intrinsic JSONs, set the board parameters, *Open cameras*.
+2. Both streams are shown **raw (distorted)** with a per-camera green/red
+   detection border — no undistortion is needed anywhere; the math converts
+   detected corners to exact 3D rays via the fisheye model and runs planar
+   PnP on ray-normalized coordinates (identity camera matrix, no pinhole
+   approximation).
+3. Capture **10–20 pairs** (Space or auto-capture — requires both views
+   green). **Hold the board still at each capture**: the two cameras are not
+   hardware-synchronized, so board motion between the two grabs corrupts a
+   pair. Vary board position/angle across the shared field of view.
+4. *Calibrate extrinsics* — per-pair relative poses are averaged with
+   median-based outlier rejection (this also removes pairs where the
+   chessboard's 180° orientation ambiguity flipped the corner order in one
+   view). Review the report:
+   - **baseline** — compare against a ruler measurement of your rig!
+   - **rotation/translation spread** — pair-to-pair consistency
+   - **cross-view reprojection RMS** — should be a few pixels or less
+5. *Save extrinsics JSON* — contains `coord_transformation_matrix.
+   device_to_camera_front_left/right` (4×4, **meters**, ready for EgoRear's
+   `coord_trans_mat` input) plus the raw left↔right transform and quality
+   stats. The device frame is the midpoint between the cameras with the
+   average of their orientations (OpenCV axes: x right, y down, z forward).
+
+Validated on synthetic ground truth (real lens polynomials, 0.1 px corner
+noise, deliberately flipped pairs): recovers the true transform to
+0.05° / 0.5 mm and rejects the corrupted pairs.
+
 ## CLI converter (no GUI)
 
 If you already calibrated with py-OCamCalib (or MATLAB OCamCalib exported to
