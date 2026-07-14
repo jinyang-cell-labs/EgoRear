@@ -26,16 +26,38 @@ from loguru import logger
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pyocamcalib_to_egorear import convert_to_egorear
+import fast_bundle
+fast_bundle.install()  # ~20-60x faster bundle adjustment, same cost function
 
 COVERAGE_GRID = 4
 RESOLUTIONS = ["640x480", "800x600", "1280x720", "1280x960", "1920x1080", "2560x1440"]
+
+
+def detect_board(gray, pattern_size, exhaustive=False):
+    """Chessboard detection tolerant to fisheye curvature and board orientation.
+
+    Neither OpenCV detector dominates: the classic one handles downscaled /
+    noisy frames better, findChessboardCornersSB handles strong fisheye
+    curvature better. Try both, each in both (rows, cols) orderings, since
+    detection requires the pattern size to match its apparent orientation.
+    Returns (ok, corners Nx2 or None).
+    """
+    sb_flags = cv2.CALIB_CB_EXHAUSTIVE if exhaustive else 0
+    classic_flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
+    for size in (pattern_size, pattern_size[::-1]):
+        ok, corners = cv2.findChessboardCorners(gray, size, flags=classic_flags)
+        if not ok:
+            ok, corners = cv2.findChessboardCornersSB(gray, size, flags=sb_flags)
+        if ok:
+            return True, corners.reshape(-1, 2)
+    return False, None
 
 
 def list_video_devices():
@@ -52,15 +74,16 @@ def list_video_devices():
 
 
 class CaptureThread(QThread):
-    frame_ready = Signal(np.ndarray, bool)  # preview frame (BGR), board hint
+    """Reads frames at full camera rate; does NO detection (see HintThread)."""
+
+    frame_ready = Signal(np.ndarray)  # preview frame (BGR)
     error = Signal(str)
 
-    def __init__(self, device, width, height, pattern_size):
+    def __init__(self, device, width, height):
         super().__init__()
         self.device = device
         self.width = width
         self.height = height
-        self.pattern_size = pattern_size  # (rows, cols) inner corners
         self._running = True
         self._lock = threading.Lock()
         self._latest = None
@@ -84,8 +107,6 @@ class CaptureThread(QThread):
             return
         self.actual_size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
                             int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        n = 0
-        hint = False
         while self._running:
             ok, frame = cap.read()
             if not ok:
@@ -93,21 +114,52 @@ class CaptureThread(QThread):
                 break
             with self._lock:
                 self._latest = frame
-            n += 1
-            if n % 5 == 0:  # cheap detection hint on a downscaled frame
-                small = cv2.resize(frame, None, fx=520 / frame.shape[0],
-                                   fy=520 / frame.shape[0])
-                gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                hint, _ = cv2.findChessboardCorners(
-                    gray, self.pattern_size,
-                    flags=cv2.CALIB_CB_FAST_CHECK + cv2.CALIB_CB_ADAPTIVE_THRESH)
-            self.frame_ready.emit(frame, bool(hint))
+            self.frame_ready.emit(frame)
         cap.release()
+
+
+class HintThread(QThread):
+    """Runs board detection on the latest frame, decoupled from the stream.
+
+    Reads the pattern size through a callable each round, so changing the
+    rows/cols fields takes effect immediately (no camera reopen needed).
+    """
+
+    hint_changed = Signal(bool)
+
+    def __init__(self, capture_thread, get_pattern):
+        super().__init__()
+        self.capture_thread = capture_thread
+        self.get_pattern = get_pattern
+        self._running = True
+
+    def stop(self):
+        self._running = False
+        self.wait(3000)
+
+    def run(self):
+        while self._running:
+            frame = self.capture_thread.latest_frame()
+            if frame is None:
+                self.msleep(100)
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            small = cv2.resize(gray, None, fx=520 / gray.shape[0],
+                               fy=520 / gray.shape[0])
+            ok, _ = detect_board(small, self.get_pattern())
+            self.hint_changed.emit(bool(ok))
+            self.msleep(150)
 
 
 class CalibrationThread(QThread):
     log = Signal(str)
     done = Signal(object, object, str)  # egorear_dict, report_lines, error
+
+    # Bundle adjustment is a pure-Python Levenberg-Marquardt over ~12 params
+    # per image; its runtime grows superlinearly with image count. Beyond
+    # ~25 well-spread views extra images barely improve accuracy but can
+    # push the optimization from minutes to an hour.
+    MAX_IMAGES = 25
 
     def __init__(self, work_dir, pattern_size, square_size, cam_name, frame_size):
         super().__init__()
@@ -117,10 +169,30 @@ class CalibrationThread(QThread):
         self.cam_name = cam_name
         self.frame_size = frame_size  # (w, h)
 
+    def _subsample_images(self):
+        """Keep MAX_IMAGES evenly-spaced captures; hide the rest via rename.
+
+        Returns the list of renamed paths so they can be restored afterwards.
+        """
+        imgs = sorted(glob.glob(os.path.join(self.work_dir, "*.png")))
+        if len(imgs) <= self.MAX_IMAGES:
+            return []
+        keep_idx = set(np.linspace(0, len(imgs) - 1, self.MAX_IMAGES).round().astype(int))
+        hidden = []
+        for i, p in enumerate(imgs):
+            if i not in keep_idx:
+                os.rename(p, p + ".skip")
+                hidden.append(p)
+        self.log.emit(f"using {self.MAX_IMAGES} of {len(imgs)} captures "
+                      f"(evenly spaced) to keep the optimization fast")
+        return hidden
+
     def run(self):
         sink_id = logger.add(lambda msg: self.log.emit(msg.strip()),
                              format="{message}", level="INFO")
+        hidden = []
         try:
+            hidden = self._subsample_images()
             from pyocamcalib.modelling.calibration import CalibrationEngine
             engine = CalibrationEngine(self.work_dir, self.pattern_size,
                                        self.cam_name, self.square_size)
@@ -141,6 +213,8 @@ class CalibrationThread(QThread):
         except Exception as e:  # surfaced in the GUI, not a crash
             self.done.emit(None, None, str(e))
         finally:
+            for p in hidden:
+                os.rename(p + ".skip", p)
             logger.remove(sink_id)
 
 
@@ -182,7 +256,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("EgoRear fisheye intrinsic calibration")
         self.capture_thread = None
+        self.hint_thread = None
         self.calib_thread = None
+        self._shared_pattern = (7, 10)  # updated from spinboxes (main thread)
         self.calib_result = None
         self.n_captured = 0
         self.saved_files = []
@@ -224,13 +300,13 @@ class MainWindow(QMainWindow):
         g = QGridLayout(board_box)
         self.rows_spin = QSpinBox()
         self.rows_spin.setRange(3, 30)
-        self.rows_spin.setValue(6)
+        self.rows_spin.setValue(7)
         self.cols_spin = QSpinBox()
         self.cols_spin.setRange(3, 30)
-        self.cols_spin.setValue(8)
+        self.cols_spin.setValue(10)
         self.square_spin = QDoubleSpinBox()
         self.square_spin.setRange(1.0, 500.0)
-        self.square_spin.setValue(30.0)
+        self.square_spin.setValue(25.0)
         self.square_spin.setSuffix(" mm")
         g.addWidget(QLabel("Rows"), 0, 0)
         g.addWidget(self.rows_spin, 0, 1)
@@ -238,24 +314,37 @@ class MainWindow(QMainWindow):
         g.addWidget(self.cols_spin, 0, 3)
         g.addWidget(QLabel("Square size"), 1, 0)
         g.addWidget(self.square_spin, 1, 1, 1, 3)
-        g.addWidget(QLabel("If detection never triggers, swap rows/columns."), 2, 0, 1, 4)
+        self.rows_spin.valueChanged.connect(self._update_pattern)
+        self.cols_spin.valueChanged.connect(self._update_pattern)
         panel.addWidget(board_box)
 
         cap_box = QGroupBox("Capture")
         g = QGridLayout(cap_box)
         self.capture_btn = QPushButton("Capture  (Space)")
-        self.capture_btn.clicked.connect(self._capture)
+        self.capture_btn.clicked.connect(lambda: self._capture())
         self.capture_btn.setEnabled(False)
         self.undo_btn = QPushButton("Discard last")
         self.undo_btn.clicked.connect(self._undo)
         self.undo_btn.setEnabled(False)
-        self.count_label = QLabel("0 captured (aim for 30–60)")
+        self.count_label = QLabel("0 captured (aim for ~25)")
         self.coverage = CoverageWidget()
+        self.auto_check = QCheckBox("Auto-capture while green at")
+        self.auto_rate = QDoubleSpinBox()
+        self.auto_rate.setRange(0.2, 5.0)
+        self.auto_rate.setSingleStep(0.5)
+        self.auto_rate.setValue(1.0)
+        self.auto_rate.setSuffix(" Hz")
+        self.auto_timer = QTimer(self)
+        self.auto_timer.timeout.connect(self._auto_capture_tick)
+        self.auto_check.toggled.connect(self._auto_capture_toggled)
+        self.auto_rate.valueChanged.connect(self._auto_capture_toggled)
         g.addWidget(self.capture_btn, 0, 0)
         g.addWidget(self.undo_btn, 0, 1)
-        g.addWidget(self.count_label, 1, 0, 1, 2)
-        g.addWidget(QLabel("Coverage"), 2, 0)
-        g.addWidget(self.coverage, 2, 1)
+        g.addWidget(self.auto_check, 1, 0)
+        g.addWidget(self.auto_rate, 1, 1)
+        g.addWidget(self.count_label, 2, 0, 1, 2)
+        g.addWidget(QLabel("Coverage"), 3, 0)
+        g.addWidget(self.coverage, 3, 1)
         panel.addWidget(cap_box)
 
         calib_box = QGroupBox("Calibrate && save")
@@ -309,8 +398,14 @@ class MainWindow(QMainWindow):
     def _pattern_size(self):
         return (self.rows_spin.value(), self.cols_spin.value())
 
+    def _update_pattern(self):
+        # plain tuple swap is atomic; safe to read from HintThread
+        self._shared_pattern = self._pattern_size()
+
     def _toggle_camera(self):
         if self.capture_thread is not None:
+            self.hint_thread.stop()
+            self.hint_thread = None
             self.capture_thread.stop()
             self.capture_thread = None
             self.open_btn.setText("Open camera")
@@ -326,13 +421,33 @@ class MainWindow(QMainWindow):
         except ValueError:
             QMessageBox.warning(self, "Bad resolution", "Use e.g. 1280x720.")
             return
-        self.capture_thread = CaptureThread(dev, w, h, self._pattern_size())
+        self._update_pattern()
+        self.capture_thread = CaptureThread(dev, w, h)
         self.capture_thread.frame_ready.connect(self._show_frame)
         self.capture_thread.error.connect(self._camera_error)
         self.capture_thread.start()
+        self.hint_thread = HintThread(self.capture_thread,
+                                      lambda: self._shared_pattern)
+        self.hint_thread.hint_changed.connect(self._set_hint)
+        self.hint_thread.start()
         self.open_btn.setText("Close camera")
         self.capture_btn.setEnabled(True)
         QTimer.singleShot(1500, self._report_actual_size)
+
+    def _set_hint(self, ok):
+        self.board_hint = ok
+
+    # ---------- auto capture ----------
+    def _auto_capture_toggled(self):
+        if self.auto_check.isChecked():
+            self.auto_timer.start(int(1000.0 / self.auto_rate.value()))
+        else:
+            self.auto_timer.stop()
+
+    def _auto_capture_tick(self):
+        if self.capture_thread is None or not self.board_hint:
+            return
+        self._capture(auto=True)
 
     def _report_actual_size(self):
         if self.capture_thread and self.capture_thread.actual_size:
@@ -345,10 +460,8 @@ class MainWindow(QMainWindow):
         self._log(f"camera error: {msg}")
         self._toggle_camera()
 
-    def _show_frame(self, frame, board_hint):
-        self.board_hint = board_hint
-        h, w = frame.shape[:2]
-        border = (0, 200, 0) if board_hint else (0, 0, 200)
+    def _show_frame(self, frame):
+        border = (0, 200, 0) if self.board_hint else (0, 0, 200)
         frame = cv2.copyMakeBorder(frame, 6, 6, 6, 6, cv2.BORDER_CONSTANT,
                                    value=border)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -358,7 +471,7 @@ class MainWindow(QMainWindow):
             self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     # ---------- capture ----------
-    def _capture(self):
+    def _capture(self, auto=False):
         if self.capture_thread is None:
             return
         frame = self.capture_thread.latest_frame()
@@ -367,18 +480,18 @@ class MainWindow(QMainWindow):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         scale = 520.0 / gray.shape[0]
         small = cv2.resize(gray, None, fx=scale, fy=scale)
-        ok, corners = cv2.findChessboardCornersSB(
-            small, self._pattern_size(), flags=cv2.CALIB_CB_EXHAUSTIVE)
+        ok, corners = detect_board(small, self._pattern_size(), exhaustive=True)
         if not ok:
-            self._log("rejected: no chessboard detected in this frame")
+            if not auto:  # in auto mode a stale green hint is expected noise
+                self._log("rejected: no chessboard detected in this frame")
             return
-        corners = corners.reshape(-1, 2) / scale
+        corners = corners / scale
         path = os.path.join(self.work_dir, f"frame_{self.n_captured:04d}.png")
         cv2.imwrite(path, frame)
         self.saved_files.append((path, corners))
         self.n_captured += 1
         self.coverage.add_corners(corners, (frame.shape[1], frame.shape[0]))
-        self.count_label.setText(f"{self.n_captured} captured (aim for 30–60)")
+        self.count_label.setText(f"{self.n_captured} captured (aim for ~25)")
         self.undo_btn.setEnabled(True)
         self.calib_btn.setEnabled(self.n_captured >= 5)
         self._log(f"captured frame {self.n_captured}")
@@ -389,7 +502,7 @@ class MainWindow(QMainWindow):
         path, _ = self.saved_files.pop()
         os.remove(path)
         self.n_captured -= 1
-        self.count_label.setText(f"{self.n_captured} captured (aim for 30–60)")
+        self.count_label.setText(f"{self.n_captured} captured (aim for ~25)")
         self.coverage.reset()
         for p, corners in self.saved_files:
             img = cv2.imread(p)
@@ -444,6 +557,8 @@ class MainWindow(QMainWindow):
         self._log(f"saved {path}")
 
     def closeEvent(self, event):
+        if self.hint_thread:
+            self.hint_thread.stop()
         if self.capture_thread:
             self.capture_thread.stop()
         super().closeEvent(event)

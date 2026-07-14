@@ -40,9 +40,14 @@ Later runs start the GUI directly.
    9×7 squares has 8×6 inner corners) and the measured square size in mm.
 3. **Capture** — the preview border turns **green** when the board is
    detected. Press **Space** (or *Capture*) to grab a frame; frames without a
-   clean detection are rejected. Aim for **30–60 captures** and fill the
-   whole coverage map, especially the image edges — that is where fisheye
-   calibrations go wrong. Vary the board's distance and tilt.
+   clean detection are rejected. Or enable **Auto-capture** to grab a frame
+   automatically at a set rate (default 1 Hz) whenever the border is green —
+   then just move the board slowly through the whole field of view. Aim for
+   **~25 captures** and fill the whole coverage map, especially the image
+   edges — that is where fisheye calibrations go wrong. Vary the board's
+   distance and tilt. (More captures don't hurt: the optimization runtime
+   grows steeply with image count, so calibration automatically uses at most
+   25 evenly-spaced captures.)
 4. **Calibrate** — takes a few minutes; progress streams into the log. Check
    the reported numbers: overall reprojection **RMS should be well under
    1 px**; the refit/cross-check lines should be sub-0.1 px.
