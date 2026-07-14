@@ -17,4 +17,7 @@ RUN pip install --no-cache-dir \
     pip install --no-cache-dir mmcv==2.2.0 \
         -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.4/index.html
 
+# live-demo visualization (streams to a rerun viewer on the host)
+RUN pip install --no-cache-dir rerun-sdk
+
 WORKDIR /workspace/EgoRear

@@ -212,3 +212,9 @@ logs/
 scripts/
 slurm/
 download_ego4view*
+
+# Downloaded pretrained checkpoints (5+ GB, from the paper's Google Drive)
+pretrained/
+
+# rerun viewer recordings from the live demo
+*.rrd
