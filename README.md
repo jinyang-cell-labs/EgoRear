@@ -230,3 +230,11 @@ Please change `--ckpt_path` accordingly if you train the models from scratch.
 
 # Acknowledgments
 The code is inspired by [EgoPoseFormer](https://github.com/chenhongyiyang/egoposeformer).
+
+
+~/repo/py-OCamCalib/.venv/bin/rerun
+
+cd ~/repo/EgoRear
+./demo/run_live_demo.sh --ckpt pretrained/ego4view_rw_pose3d_stereo_front/lightning_logs/version_0/checkpoints/epoch=11.ckpt
+
+

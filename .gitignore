@@ -218,3 +218,7 @@ pretrained/
 
 # rerun viewer recordings from the live demo
 *.rrd
+
+# Ego4View-RW test-sequence subset (GBs of images; re-fetch with stream_extract.py)
+data_subset/*
+!data_subset/stream_extract.py
