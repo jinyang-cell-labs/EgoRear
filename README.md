@@ -237,4 +237,6 @@ The code is inspired by [EgoPoseFormer](https://github.com/chenhongyiyang/egopos
 cd ~/repo/EgoRear
 ./demo/run_live_demo.sh --ckpt pretrained/ego4view_rw_pose3d_stereo_front/lightning_logs/version_0/checkpoints/epoch=11.ckpt
 
+~/repo/EgoRear/demo/view_dataset_eval.sh
+
 
